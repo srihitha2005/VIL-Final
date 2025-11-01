@@ -73,6 +73,8 @@ class SmoothedValue(object):
 
     @property
     def value(self):
+        if not self.deque:
+            return 0.01 # Return 0.01 if the deque is empty
         return self.deque[-1]
 
     def __str__(self):
