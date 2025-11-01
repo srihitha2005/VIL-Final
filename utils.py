@@ -20,6 +20,26 @@ import datetime
 
 import torch
 import torch.distributed as dist
+import torch
+
+def create_optimizer(args, model):
+    """
+    Creates an Adam or AdamW optimizer depending on args.
+    Expected args:
+        - args.lr : learning rate
+        - args.weight_decay : weight decay (optional)
+        - args.optimizer : optional, e.g., 'adam' or 'adamw'
+    """
+    lr = getattr(args, 'lr', 1e-4)
+    wd = getattr(args, 'weight_decay', 1e-4)
+    opt_type = getattr(args, 'optimizer', 'adam').lower()
+
+    if opt_type == 'adamw':
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+
+    return optimizer
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
