@@ -444,7 +444,7 @@ class Engine():
                 output = torch.stack(output_ensemble, dim=-1).max(dim=-1)[0]
                 
                 loss = criterion(output.log(), target)
-                acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
+                acc1, acc5 = accuracy(output, target, topk=(1, 5))
                 _, preds = torch.max(output, 1)
                 
                 all_targets.extend(target.cpu().tolist())
