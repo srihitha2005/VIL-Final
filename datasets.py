@@ -144,10 +144,10 @@ def build_continual_dataloader(args):
             
             if args.dataset in ['CORe50']:
                 splited_dataset = [(dataset_train[i], dataset_val) for i in range(len(dataset_train))]
-                args.nb_classes = len(dataset_val.classes)
+                args.nb_classes = len(5)
             else:
                 splited_dataset = [(dataset_train, dataset_val) for i in range(len(dataset_train))]
-                args.nb_classes = dataset_val.classes
+                args.nb_classes = 5
     
     elif mode in ['joint']:
         if 'iDigits' in args.dataset:
@@ -164,7 +164,7 @@ def build_continual_dataloader(args):
                 )
                 train.append(dataset_train)
                 val.append(dataset_val)
-                args.nb_classes = len(dataset_val.classes)
+                args.nb_classes = len(5)
 
             dataset_train = torch.utils.data.ConcatDataset(train)
             dataset_val = torch.utils.data.ConcatDataset(val)
@@ -183,7 +183,7 @@ def build_continual_dataloader(args):
 
             splited_dataset = [(dataset_train, dataset_val)]
 
-            args.nb_classes = len(dataset_val.classes)
+            args.nb_classes = len(5)
             class_mask = None
             
     else:
