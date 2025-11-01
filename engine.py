@@ -350,7 +350,7 @@ class Engine():
             ewc_loss = self.weight_importance_regularization(model, lambda_ewc)
             loss += ewc_loss
             
-            acc1, acc5 = utils.accuracy(logits, target, topk=(1, 5))
+            acc1, acc5 = accuracy(logits, target, topk=(1, 5))
             
             optimizer.zero_grad()
             loss.backward()
