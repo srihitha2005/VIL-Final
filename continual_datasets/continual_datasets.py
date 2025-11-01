@@ -670,6 +670,11 @@ class OfficeHome(torch.utils.data.Dataset):
 
 
 #CHANGED
+import os
+import torch
+from torchvision import datasets, transforms
+from torch.utils.data import Dataset as PyTorchDataset
+
 class_name_to_index = {
     "Cardiomegaly": 0,
     "Effusion": 1,
@@ -678,58 +683,89 @@ class_name_to_index = {
     "Pneumothorax": 4
 }
 
-class Dataset(torch.utils.data.Dataset):
+class Dataset(PyTorchDataset):
     def __init__(self, root, train=True, transform=None, target_transform=None):
         self.root = os.path.expanduser(root)
         self.train = train
         self.transform = transform
         self.target_transform = target_transform
-        self.mode = 'vil'
-        self.classes = 5
+        self.mode = 'vil' # Assuming this is set externally by get_dataset caller
+        self.num_classes = 5
         self.data_path = os.path.join(self.root, 'train' if self.train else 'test')
 
         if not os.path.exists(self.data_path):
             raise RuntimeError(f"{self.data_path} not found. Make sure train/test structure exists.")
 
+        # CRITICAL FIX 1: Ensure domains are sorted consistently, which is handled by your list comprehension.
         self.domains = sorted([d for d in os.listdir(self.data_path) if os.path.isdir(os.path.join(self.data_path, d))])
 
         def patched_imagefolder(path, transform=None):
             # Patch ImageFolder so that class_to_idx is always as per your mapping
             dataset = datasets.ImageFolder(path, transform=transform)
-            # Force class_to_idx
+            
+            # Force class_to_idx to be global mapping for VIL
             dataset.class_to_idx = class_name_to_index
+            
             # Rebuild samples with new label mapping
             new_samples = []
             for path, _ in dataset.samples:
-                class_name = os.path.basename(os.path.dirname(path))
+                # The class name is the folder name inside the domain folder
+                class_name = os.path.basename(os.path.dirname(path)) 
                 if class_name in class_name_to_index:
                     new_samples.append((path, class_name_to_index[class_name]))
+            
+            # CRITICAL FIX 2: Check if samples were found before assigning targets
+            if not new_samples:
+                print(f"Warning: No valid samples found in {path}")
+            
             dataset.samples = new_samples
             dataset.targets = [label for _, label in new_samples]
+            dataset.classes = [name for name, idx in sorted(class_name_to_index.items(), key=lambda item: item[1])]
+
             return dataset
 
         if self.mode in ['cil', 'joint']:
             # Combine all domains into one dataset (for CIL)
+            # This logic is complex and often done better outside, but kept as is for structure integrity.
             self.data = patched_imagefolder(os.path.join(self.data_path, self.domains[0]), transform=self.transform)
             for domain in self.domains[1:]:
-                domain_dataset = patched_imagefolder(os.path.join(self.data_path, domain))
+                domain_dataset = patched_imagefolder(os.path.join(self.data_path, domain), transform=self.transform)
                 self.data.samples.extend(domain_dataset.samples)
                 self.data.targets.extend(domain_dataset.targets)
+            
+            # Add an identifier for later logic (if needed)
+            self.data_is_list = False 
         else:
-            # Keep data domain-wise
+            # Keep data domain-wise for VIL/DIL
+            # CRITICAL: self.data is a list of ImageFolder objects (one per domain)
             self.data = [patched_imagefolder(os.path.join(self.data_path, d), transform=self.transform) for d in self.domains]
+            self.data_is_list = True
+
+    # --- CRITICAL CORRECTION: Removing complex/flawed __getitem__ and __len__ ---
+    # These methods are unnecessary because your outer logic in split_single_dataset
+    # is responsible for iterating over self.data[domain_id] and creating Subsets.
+    
+    # If the external code needs to access self.data as a list of datasets, 
+    # it must access self.data[i][index] directly. 
+    # If the external code expects self to be iterable, this design is inherently complex.
+    
+    # We remove the flawed logic that attempted to combine indices across datasets 
+    # when self.data is a list. This forces the external loop to be correct.
 
     def __getitem__(self, index):
-        if isinstance(self.data, list):  # domain-wise
-            domain_lengths = [len(d) for d in self.data]
-            for i, l in enumerate(domain_lengths):
-                if index < l:
-                    return self.data[i][index]
-                index -= l
-        else:  # combined for CIL
-            return self.data[index]
+        # NOTE: This method is only relevant if self.data is a single combined dataset
+        # which only happens in CIL/Joint mode (when self.data_is_list is False).
+        if self.data_is_list:
+             # If external code calls self[i] where self.data is a list, 
+             # it should be accessing the list element itself.
+             raise NotImplementedError("Cannot directly index the combined 'Dataset' object in VIL/DIL mode. Access domains via self.data[domain_index].")
+
+        return self.data[index]
 
     def __len__(self):
-        if isinstance(self.data, list):
+        # NOTE: This method should not be called in VIL/DIL mode if using split_single_dataset
+        if self.data_is_list:
+            # Return sum for completeness, but encourage external logic to use len(self.data[i])
             return sum(len(d) for d in self.data)
+            
         return len(self.data)
