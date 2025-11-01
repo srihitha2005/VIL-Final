@@ -666,7 +666,9 @@ class Engine():
                     # NOTE: teacher_feat should come from the frozen *previous* model state, not current model
                     # Assuming 'self.teacher_model' exists and is a copy of 'model' before task start
                     with torch.no_grad():
-                        teacher_feat = self.distill_head(input).detach()
+                        feat = model.forward_features(input)
+                        teacher_feat = self.distill_head(feat).detach()
+
 
 
                 feature_loss = 1 - self.cs(student_feat, teacher_feat).mean()
