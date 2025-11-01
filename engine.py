@@ -112,7 +112,7 @@ class Engine():
         self.final_all_preds = []
 
         #replay
-        self.buffer_size = 0
+        self.buffer_size = 8000
         self.seen_classes = set()
         self.num_domains_per_class = defaultdict(lambda: 0)
         
