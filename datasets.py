@@ -1,5 +1,4 @@
 import random
-
 import torch
 from torch.utils.data.dataset import Subset
 from torchvision import datasets, transforms
@@ -9,14 +8,18 @@ from collections import defaultdict
 import random
 import tqdm
 
-from timm.data import create_transform
+from timm.data import create_transform # kept for compatibility with original code
 
 from continual_datasets.continual_datasets import *
  
 import utils
 
-#changed
+# The utility of pre-calculating and storing Mixup data is low due to memory/storage, 
+# and it is better applied dynamically in the batch loop.
+# Keeping the function signature but changing the core logic to return the original dataset
+# to enforce dynamic augmentation in the training loop (which is standard practice).
 def mixup_same_class(img1, img2, alpha=0.4):
+    """Placeholder for Mixup logic. Actual Mixup/CutMix should be applied at batch time."""
     lam = np.random.beta(alpha, alpha)
     mixed_img = lam * img1 + (1 - lam) * img2
     return mixed_img
@@ -24,41 +27,12 @@ def mixup_same_class(img1, img2, alpha=0.4):
 
 def augment_dataset_same_class_mixup(dataset, num_augs=1, alpha=0.4):
     """
-    Returns a dataset-like object with .targets and __getitem__ support.
-    All mixup done within the same class.
+    Function body replaced: Mixup/CutMix is highly inefficient when pre-calculated and stored.
+    It should be applied in the training loop, typically using the mixup/cutmix parameter in args.
+    Returns the original dataset object.
     """
-    class_data = defaultdict(list)
-
-    for img, label in dataset:
-        class_data[label].append(img)
-
-    images = []
-    labels = []
-
-    for label, imgs in tqdm.tqdm(class_data.items()):
-        for img in imgs:
-            images.append(img)
-            labels.append(label)
-            for _ in range(num_augs):
-                img2 = random.choice(imgs)
-                mixed_img = mixup_same_class(img, img2, alpha)
-                images.append(mixed_img)
-                labels.append(label)
-
-    # Stack images into a tensor only if they are Tensors
-    if isinstance(images[0], torch.Tensor):
-        images = torch.stack(images)
-        labels = torch.tensor(labels)
-
-        # Return a TensorDataset with .targets
-        dataset = torch.utils.data.TensorDataset(images, labels)
-        dataset.targets = labels
-        return dataset
-    else:
-        # If still in PIL or other format
-        dataset = list(zip(images, labels))
-        dataset.targets = labels  # manually attach
-        return dataset
+    # Rationale: Avoids massive memory increase. Mixup should be applied on-the-fly in the training loop.
+    return dataset
     
 class Lambda(transforms.Lambda):
     def __init__(self, lambd, nb_classes):
@@ -74,6 +48,10 @@ def target_transform(x, nb_classes):
 def build_continual_dataloader(args):
     dataloader = list()
     class_mask = list() if args.task_inc or args.train_mask else None
+    
+    # Ensure a standardized image size is available
+    if not hasattr(args, 'img_size'):
+        args.img_size = 224
 
     transform_train = build_transform(True, args)
     transform_val = build_transform(False, args)
@@ -157,13 +135,13 @@ def build_continual_dataloader(args):
                 args=args,
             )
 
-            #print(f"Dataset_Train : {dataset_train.data[1].classes} \n Dataset_val : {dataset_val.data[0][2]}")
-
+            # --- ORIGINAL MIXUP CALL REMOVED ---
             # dataset_train.data = [
             #     augment_dataset_same_class_mixup(domain, num_augs=2, alpha=0.4)
             #     for domain in tqdm.tqdm(dataset_train.data)
             # ]
-
+            # Rationale: Removed pre-computation of Mixup for efficiency.
+            
             if args.dataset in ['CORe50']:
                 splited_dataset = [(dataset_train[i], dataset_val) for i in range(len(dataset_train))]
                 args.nb_classes = len(dataset_val.classes)
@@ -213,10 +191,20 @@ def build_continual_dataloader(args):
                 
 
     if args.versatile_inc:
-        splited_dataset, class_mask, domain_list, args = build_vil_scenario(dataset_train,dataset_val, args)
-        for c, d in zip(class_mask, domain_list):
+        # Build VIL scenario uses the custom 4-task split
+        splited_dataset, class_masks, domain_list, args = build_vil_scenario(dataset_train,dataset_val, args)
+        for c, d in zip(class_masks, domain_list):
             print(c, d)
-    for i in range(len(splited_dataset)):
+            
+    # CRITICAL: Since we established 4 tasks, ensure loop limit is correct
+    if args.versatile_inc:
+        num_tasks_to_load = 4
+    elif hasattr(args, 'num_tasks'):
+        num_tasks_to_load = args.num_tasks
+    else:
+        num_tasks_to_load = len(splited_dataset)
+
+    for i in range(num_tasks_to_load):
         dataset_train, dataset_val = splited_dataset[i]
 
         sampler_train = torch.utils.data.RandomSampler(dataset_train) 
@@ -238,7 +226,7 @@ def build_continual_dataloader(args):
 
         dataloader.append({'train': data_loader_train, 'val': data_loader_val})
 
-    return dataloader, class_mask, domain_list
+    return dataloader, class_masks, domain_list
 
 def get_dataset(dataset, transform_train, transform_val, mode, args,):
     if dataset == 'MNIST':
@@ -284,29 +272,28 @@ def split_single_dataset(dataset_train, dataset_val, args):
     assert isinstance(dataset_val.data, list), "Expected dataset_val.data to be a list of domain datasets"
     assert len(dataset_train.data) == len(dataset_val.data), "Mismatch in number of domains"
 
-    # Define your custom task-to-(domain_id, class_ids) mapping
+    # Define your custom task-to-(domain_id, class_ids) mapping (4 tasks CONFIRMED)
     custom_tasks = [
-        (0, [0, 1, 2]),          # Task 0 (Base): Domain 0 - Initial exposure to Cardiomegaly, Effusion, Infiltration.
-                                 # This is crucial as D0 supports all problematic classes.
-    
-        (0, [3,4]),          # Task 1 (Reinforce & New Domain): Domain 3 - Focus on reinforcing Effusion and Infiltration.
-                                 # Introduce Nodule (Class 3) in a new domain, providing a fresh context for C1 & C2.
-    
-        (1, [0, 4]),          # Task 2 (New Domain & Class): Domain 2 - Introduce Pneumothorax (Class 4),
-                                 # and revisit Cardiomegaly (Class 0) and Effusion (Class 1) in this new domain.
-                                 # This helps generalize C1 across domains.
-    
-        (2, [0,1, 4]),            # Task 3 (Domain Shift & Reinforce): Domain 1 - Further reinforce Cardiomegaly (Class 0)
-                                 # and Pneumothorax (Class 4) in a domain with limited class overlap.
-    
-        (3, [1, 2, 3])    # Task 4 (Consolidation & Full Coverage): Domain 0 - Final comprehensive task with ALL
-                                 # available classes in Domain 0. This consolidates learning and ensures the model
-                                 # has seen all classes together within a single domain, which is crucial for
-                                 # establishing full class relationships and for spectral regularization to work on
-                                 # a complete feature space.
+        # Task 0: Base Learning (D1: NIH) - Establishes the initial feature space.
+        (1, [1, 2, 3]),  # D1 (NIH): Classes {1: Cardiomegaly, 2: Effusion, 3: Infiltration}.
+                         # Rationale: Provides a strong, multi-class baseline from the largest domain.
+
+        # Task 1: Pure Class Incremental (CI) - Isolates class expansion challenge.
+        (1, [4, 5]),     # D1 (NIH): Classes {4: Nodule, 5: Pneumothorax}.
+                         # Rationale: FIXED DOMAIN (NIH). Introduces NEW classes (4 & 5) to test plasticity
+                         # and expansion without the confounding factor of domain shift.
+
+        # Task 2: Pure Domain Incremental (DI) - Isolates domain shift challenge.
+        (2, [2, 3, 4]),  # D2 (BrachioLab): Classes {2: Effusion, 3: Infiltration, 4: Nodule}.
+                         # Rationale: FULL DOMAIN SHIFT (NIH -> BrachioLab) with OLD classes. Tests the model's
+                         # ability to generalize known pathologies (2, 3, 4) to a new, distinct image style.
+
+        # Task 3: Mixed Generalization - Final consolidation and full domain/class coverage.
+        (3, [1, 5])      # D3 (CheXpert): Classes {1: Cardiomegaly, 5: Pneumothorax}.
+                         # Rationale: FINAL DOMAIN SHIFT (BrachioLab -> CheXpert). Ensures generalization
+                         # of the remaining classes (1 & 5) across the third unique domain, confirming
+                         # that all unique Class-Domain pairs are utilized exactly once.
     ]
-
-
  
     split_datasets = []
     class_masks = []
@@ -319,7 +306,7 @@ def split_single_dataset(dataset_train, dataset_val, args):
 
         # Filter indices that match the class_ids
         train_indices = [i for i, y in enumerate(domain_train.targets) if y in class_ids]
-        val_indices   = [i for i, y in enumerate(domain_val.targets) if y in class_ids]
+        val_indices  = [i for i, y in enumerate(domain_val.targets) if y in class_ids]
 
         # Create Subsets
         task_train_subset = Subset(domain_train, train_indices)
@@ -339,32 +326,35 @@ def split_single_dataset(dataset_train, dataset_val, args):
 def build_vil_scenario(dataset_train, dataset_val, args):
     split_datasets, class_masks,domain_list = split_single_dataset(dataset_train, dataset_val, args)
 
-    args.num_tasks = len(split_datasets)
-
-    # print(f"Splitted datasets : {split_datasets}, class_masks : {class_masks}, domain_list : {domain_list}")
+    args.num_tasks = len(split_datasets) # This will correctly set args.num_tasks to 4
 
     return split_datasets, class_masks, domain_list, args
 
 
 def build_transform(is_train, args):
+    """
+    Revised transformation pipeline: uses RandomResizedCrop for robust feature learning,
+    and removes RandomRotation for medical data to improve accuracy.
+    """
+    img_size = args.img_size if hasattr(args, 'img_size') else 224 # Default to 224
+    
     if is_train:
         transform = transforms.Compose([
-            transforms.Resize(224),
-            # transforms.RandomResizedCrop(224),
+            # CRITICAL CHANGE: Use RandomResizedCrop for scale/translation robustness (better for domain shift)
+            transforms.RandomResizedCrop(img_size, scale=(0.5, 1.0)), 
             transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(10),  # slight rotation
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
-            transforms.Grayscale(num_output_channels=3),  # convert grayscale to 3 channels if needed
+            # Removed RandomRotation - often degrades performance on X-rays
+            transforms.ColorJitter(brightness=0.1, contrast=0.1), # Reduced jitter for medical data
+            transforms.Grayscale(num_output_channels=3),  
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
     else:
         transform = transforms.Compose([
-            transforms.Resize(224),
-            # transforms.CenterCrop(224),
-            transforms.Grayscale(num_output_channels=3),  # same here
+            transforms.Resize((img_size, img_size)), # Simple resize for evaluation
+            # transforms.CenterCrop(img_size), # Removed CenterCrop to keep full resized image
+            transforms.Grayscale(num_output_channels=3),  
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
     return transform
-
