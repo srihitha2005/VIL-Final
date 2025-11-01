@@ -3,34 +3,32 @@ import sys
 import os
 import datetime
 import json
-from turtle import undo
-from typing import Iterable
 import random
-from pathlib import Path 
-from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+import copy
+import numpy as np
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import seaborn as sns
-from collections import Counter
-import torch
 
-import numpy as np
+from pathlib import Path
+from typing import Iterable
+from operator import itemgetter
+from collections import defaultdict, Counter
 
-from timm.utils import accuracy
-from timm.optim import create_optimizer
-from timm.utils.model_ema import ModelEmaV2
-import copy
-import utils
-import torch.nn.functional as F
-from sklearn.cluster import KMeans
-from sklearn.manifold import TSNE
-import matplotlib.pyplot as plt
-from collections import defaultdict
-from sklearn.metrics import confusion_matrix
-
-#Changed
 from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
 from sklearn.model_selection import train_test_split
+from sklearn.cluster import KMeans
+# from sklearn.manifold import TSNE # Kept optional, uncomment if needed
+
+from timm.utils import accuracy, ModelEmaV2
+from timm.optim import create_optimizer
+from timm.data import create_transform # Assuming needed for build_transform
+# Assuming 'utils' is a local module containing MetricLogger, save_on_master, etc.
+import utils
 
 #Not using validation anymore
 class EarlyStopping:
@@ -300,9 +298,9 @@ class Engine():
         sample_score = (loss.item() + (1.0 - max_confidence.item()))
         return sample_score
     
-    import random
-    from operator import itemgetter
-    from collections import defaultdict
+     random
+    from operator  itemgetter
+    from collections  defaultdict
 
     def _update_buffer_quota(self):
         """
@@ -386,10 +384,6 @@ class Engine():
     # Note: The _rebalance_buffer function relies on the sample data (which is a tuple stored in the buffer)
     # containing the domain ID, e.g., sample = (data_tensor, target_tensor, domain_id).
     # If your dataset loader does not provide the domain ID in the sample tuple, you must adjust the loader.
-
-    #Changed till now
-    import torch
-    import torch.nn.functional as F
 
     # Keeping kl_div the same as it is a standard and correct function.
     def kl_div(self, p, q):
@@ -579,11 +573,7 @@ class Engine():
         weights = weights / torch.sum(weights) # summation-> 1
         return weights
     
-    import math
-    import torch
-    # from torch.utils.data import Iterable
-    from typing import Iterable # Explicit import for type hint
-
+    
     # Assuming accuracy function is available globally or imported via utils
     # from utils import accuracy 
 
@@ -841,9 +831,6 @@ class Engine():
         # The original logic was complex due to the in-place modification of 'output'
         return aggregated_output
 
-    import numpy as np
-    from sklearn.metrics import confusion_matrix
-    import torch # Included for consistency
 
     def print_final_results(self):
         """
@@ -943,12 +930,7 @@ class Engine():
             print("No cumulative predictions available for confusion matrix/per-class metrics.")
 
     
-    from collections import Counter
-    import numpy as np
-    import torch
-    from sklearn.metrics import precision_recall_fscore_support
-    from typing import Iterable
-
+    
     # Assuming accuracy function is available globally or imported via utils
     # from utils import accuracy 
 
@@ -1073,10 +1055,6 @@ class Engine():
         return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, all_targets, all_preds
 
 
-    from collections import defaultdict
-    import numpy as np
-    import torch
-    from typing import Iterable
 
     @torch.no_grad()
     def evaluate_till_now(self, model: torch.nn.Module, data_loader: list, 
@@ -1194,8 +1172,6 @@ class Engine():
         Prints cumulative classification metrics and standard VCL metrics (Forgetting, BWT, FWT).
         This function acts as the final reporting tool after training task 'task_id'.
         """
-        import numpy as np
-        from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
         
         # Get all unique classes seen up to the current task
         seen_classes = sorted(list(set(self.all_targets_cumulative)))
@@ -1309,9 +1285,6 @@ class Engine():
             print(f"Backward Transfer (BWT): {BWT:.4f}")
             print(f"Forward Transfer (FWT): {FWT:.4f}")
 
-    import torch
-    import copy
-    from sklearn.cluster import KMeans # Assuming this is available in your environment
 
     def flatten_parameters(self, modules):
         """
@@ -1551,14 +1524,7 @@ class Engine():
                 
         # Reset model to train mode
         model.train()
-    
-    import torch
-    import numpy as np
-    import os
-    from pathlib import Path
-    import datetime
-    import json
-    from typing import Iterable
+
     # Assuming utils.create_optimizer, utils.save_on_master, utils.is_main_process, 
     # and the Path, os, datetime, json, and EmaV2 imports are handled globally.
     # Note: EWC calculation uses the validation set data distribution for FIM estimation.
