@@ -29,6 +29,9 @@ from timm.optim import create_optimizer
 from timm.data import create_transform # Assuming needed for build_transform
 # Assuming 'utils' is a local module containing MetricLogger, save_on_master, etc.
 import utils
+import random
+from operator  import itemgetter
+from collections import defaultdict
 
 #Not using validation anymore
 class EarlyStopping:
@@ -298,9 +301,6 @@ class Engine():
         sample_score = (loss.item() + (1.0 - max_confidence.item()))
         return sample_score
     
-     random
-    from operator  itemgetter
-    from collections  defaultdict
 
     def _update_buffer_quota(self):
         """
