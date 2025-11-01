@@ -275,21 +275,21 @@ def split_single_dataset(dataset_train, dataset_val, args):
     # Define your custom task-to-(domain_id, class_ids) mapping (4 tasks CONFIRMED)
     custom_tasks = [
         # Task 0: Base Learning (D1: NIH) - Establishes the initial feature space.
-        (0, [0, 1, 2]),  # D1 (NIH): Classes {1: Cardiomegaly, 2: Effusion, 3: Infiltration}.
+        (1, [0, 1, 2]),  # D1 (NIH): Classes {1: Cardiomegaly, 2: Effusion, 3: Infiltration}.
                          # Rationale: Provides a strong, multi-class baseline from the largest domain.
 
         # Task 1: Pure Class Incremental (CI) - Isolates class expansion challenge.
-        (0, [3, 4]),     # D1 (NIH): Classes {4: Nodule, 5: Pneumothorax}.
+        (1, [3, 4]),     # D1 (NIH): Classes {4: Nodule, 5: Pneumothorax}.
                          # Rationale: FIXED DOMAIN (NIH). Introduces NEW classes (4 & 5) to test plasticity
                          # and expansion without the confounding factor of domain shift.
 
         # Task 2: Pure Domain Incremental (DI) - Isolates domain shift challenge.
-        (1, [1, 2, 3]),  # D2 (BrachioLab): Classes {2: Effusion, 3: Infiltration, 4: Nodule}.
+        (2, [1, 2, 3]),  # D2 (BrachioLab): Classes {2: Effusion, 3: Infiltration, 4: Nodule}.
                          # Rationale: FULL DOMAIN SHIFT (NIH -> BrachioLab) with OLD classes. Tests the model's
                          # ability to generalize known pathologies (2, 3, 4) to a new, distinct image style.
 
         # Task 3: Mixed Generalization - Final consolidation and full domain/class coverage.
-        (2, [0, 4])      # D3 (CheXpert): Classes {1: Cardiomegaly, 5: Pneumothorax}.
+        (3, [0, 4])      # D3 (CheXpert): Classes {1: Cardiomegaly, 5: Pneumothorax}.
                          # Rationale: FINAL DOMAIN SHIFT (BrachioLab -> CheXpert). Ensures generalization
                          # of the remaining classes (1 & 5) across the third unique domain, confirming
                          # that all unique Class-Domain pairs are utilized exactly once.
