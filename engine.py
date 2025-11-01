@@ -750,7 +750,8 @@ class Engine():
             
             # --- EWC Regularization (CRITICAL CHANGE 3) ---
             # if args.use_ewc_reg and task_id > 0:
-            ewc_loss = self.weight_importance_regularization(model, lambda_ewc=args.lambda_ewc)
+            lambda_ewc = 1000
+            ewc_loss = self.weight_importance_regularization(model, lambda_ewc)
             loss += ewc_loss
                 
             acc1, acc5 = accuracy(logits, target, topk=(1, 5))
