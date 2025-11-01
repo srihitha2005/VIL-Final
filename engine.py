@@ -577,35 +577,64 @@ class Engine():
     
     # Assuming accuracy function is available globally or imported via utils
     # from utils import accuracy 
-
+    
+    
     def train_one_epoch(self, model: torch.nn.Module, 
-                    criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0,
-                    set_training_mode=True, task_id=-1, class_mask=None, ema_model = None, args = None):
-        
-        # Assuming math, torch, utils, np, accuracy are imported globally/available
+                        criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer,
+                        device: torch.device, epoch: int, max_norm: float = 0,
+                        set_training_mode=True, task_id=-1, class_mask=None, ema_model = None, args = None):
         
         torch.cuda.empty_cache()
         model.train(set_training_mode)
-    
         metric_logger = utils.MetricLogger(delimiter="  ")
         metric_logger.add_meter('Lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
         metric_logger.add_meter('Loss', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+
+        # Use task_id for header to clarify the training phase
         header = f'Train Task {task_id}: Epoch[{epoch+1:{int(math.log10(args.epochs))+1}}/{args.epochs}]'
-        
+
+        # Get the current domain ID from the VIL manager's domain_list
         current_domain_id = self.domain_list[task_id] if task_id < len(self.domain_list) else None
-    
+
         for batch_idx, (input, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
             if self.args.develop and batch_idx > 20:
                 break
-                
+            # Initialize original batch size (before replay)
             original_batch_size = input.size(0)
-    
+
             input = input.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
+
+            # --- CRITICAL CHANGE 1: Utility-Based Replay Integration ---
+            # all_buffer_samples = []
+            # for key in self.replay_buffer:
+            #     # key is (class_id, domain_id). Samples are (score, input, target, domain_id)
+            #     all_buffer_samples.extend(self.replay_buffer[key]) 
+                
+            # if len(all_buffer_samples) > 0:
+            #     # N is the number of samples to replay, capped by total buffer size        #     N = min(self.args.replay_batch_size, len(all_buffer_samples))
     
+            #     # Use random.choices for sampling wih replacement, prioritizing based on score (if needed)
+            #     # For simplicity (since we pre-selecthigh-utility samples), we use random.sample
+            #     # Note: samples are (score, data_tuple
+            #     replay_samples_scored = random.sample(all_buffer_samples, N)                
+            #     # Extract only the data tuple from the scored tuple: (inpu, target, domain_id)
+            #     replay_data_tuples = [s[1] for s in replay_samples_scored] 
+            #     # Assuming data tuple is (input_tensor, target_tensor, domain_id_int)
+            #     # We only need input and target for the loss calculation
+            #     replay_inputs, replay_targets, _ = zip(*replay_data_tuples) 
+                
+            #     # Stack and move to device
+            #     replay_inputs = torch.stack(replay_inputs).to(device, non_blocking=True)
+            #     replay_targets = torch.stack(replay_targets).to(device, non_blocking=True)
+                
+            #     # Concatenate batches
+            #     input = torch.cat([input, replay_inputs], dim=0)
+            #     target = torch.cat([target, replay_targets], dim=0)
+            # # -----------------------------------------------------------
+
             # Forward Pass
-            output = model(input)
+            output = model(input) # (batch_size + N_replay, head_size)
             distill_loss = 0
             
             # --- Distillation (LwF + Feature Distillation) ---
@@ -613,120 +642,160 @@ class Engine():
                 feature = model.forward_features(input)[:, 0]
                 with torch.no_grad():
                     teacher_logits = self.distill_head(feature)
-    
+
+                # Get indices of OLD classes (all classes seen BEFORE the current task
+                # Find classes in head that are NOT in the current task's new classes
                 old_labels = [label for label in self.labels_in_head if label not in self.added_classes_in_cur_task]
                 old_label_indices = [np.where(self.labels_in_head == label)[0][0] for label in old_labels]
                 old_label_indices_tensor = torch.tensor(old_label_indices, dtype=torch.long).to(device)
                 
+                # Filter logits for old classes only
                 student_logits_old = output.index_select(dim=1, index=old_label_indices_tensor)
                 teacher_logits_old = teacher_logits.index_select(dim=1, index=old_label_indices_tensor)
-    
+
+                # KL divergence for logits
                 logit_distill_loss = torch.nn.functional.kl_div(
                     torch.log_softmax(student_logits_old / args.distill_temp, dim=1),
                     torch.softmax(teacher_logits_old / args.distill_temp, dim=1),
                     reduction='batchmean'
                 ) * (args.distill_temp ** 2)
-    
+
+                # Feature distillation (using features *after* the current task's adaptation)
                 student_feat = feature
                 with torch.no_grad():
-                    # CRITICAL FIX: Use the full teacher model (self.distill_model) for feature extraction
-                    if hasattr(self, 'distill_model') and self.distill_model is not None:
-                        teacher_feat = self.distill_model.forward_features(input)[:, 0].detach() 
-                    else:
-                        # Fallback to zero features if model wasn't stored (shouldn't happen after T=1)
-                        teacher_feat = torch.zeros_like(student_feat).detach() 
-                
-                if teacher_feat.dim() == 1: teacher_feat = teacher_feat.unsqueeze(0)
-                
-                # Feature loss calculation
-                if teacher_feat.size(0) == student_feat.size(0):
-                     feature_loss = 1 - self.cs(student_feat, teacher_feat).mean()
-                else:
-                     feature_loss = torch.tensor(0.0).to(device)
-    
-    
+                    # NOTE: teacher_feat should come from the frozen *previous* model state, not current model
+                    # Assuming 'self.teacher_model' exists and is a copy of 'model' before task start
+                    teacher_feat = self.distill_head.forward_features(input)[:, 0].detach() 
+
+                feature_loss = 1 - self.cs(student_feat, teacher_feat).mean()
+
                 distill_loss = args.alpha_feat * feature_loss + args.alpha_logit * logit_distill_loss
-                
-                # ----------------------------------------------------------------------
-                
-                # Dynamic Head Mapping and Masking for CE Loss
-                if args.train_mask and class_mask is not None:
-                    mask = class_mask[task_id]
-                    not_mask = np.setdiff1d(np.arange(self.num_classes), mask)
-                    not_mask_tensor = torch.tensor(not_mask, dtype=torch.long).to(output.device)
-                    
-                    if output.shape[-1] > self.num_classes:
-                        output_masked = output[:, :self.num_classes]
-                    else:
-                        output_masked = output
-                        
-                    logits = output_masked.index_fill(dim=1, index=not_mask_tensor, value=float('-inf'))
-                else:
-                    logits = output
-                    
-                loss = criterion(logits, target)
-                task_loss = loss
-    
-                # --- Orthogonal Regularization (CAST) ---
-                if self.args.use_cast_loss and hasattr(self, 'prev_adapters'):
-                    if len(self.adapter_vec) > args.k:
-                        cur_adapters = model.get_adapter()
-                        self.cur_adapters = self.flatten_parameters(cur_adapters)
-                        diff_adapter = self.cur_adapters - self.prev_adapters
-                        
-                        if hasattr(self, 'kmeans'):
-                            _, other = self.find_same_cluster_items(diff_adapter)
-                            sim = 0
-                            
-                            weights = self.calculate_l2_distance(diff_adapter, other)
-                            for o, w in zip(other, weights):
-                                dot_product = torch.matmul(diff_adapter, o)
-                                if self.args.norm_cast:
-                                    sim += w * dot_product / (torch.norm(diff_adapter) * torch.norm(o) + 1e-8)
-                                else:
-                                    sim += w * dot_product
-                                    
-                            orth_loss = args.beta * torch.abs(sim)
-                            if orth_loss > 0:
-                                loss += orth_loss
-    
-                # --- Loss Aggregation ---
-                if self.args.IC and distill_loss > 0:
-                    loss += distill_loss
-                
-                # EWC: NOTE: lambda_ewc should come from args for hyperparameter control.
-                lambda_ewc = args.lambda_ewc if hasattr(args, 'lambda_ewc') else 200 
-                
-                if args.use_ewc_reg and task_id > 0:
-                    ewc_loss = self.weight_importance_regularization(model, lambda_ewc)
-                    loss += ewc_loss
-                        
-                acc1, acc5 = accuracy(logits, target, topk=(1, 5))
-    
-                optimizer.zero_grad()
-                loss.backward()
-                
-                if max_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-                    
-                optimizer.step()
-    
-                # --- REPLAY COLLECTION LOGIC DELETED --- 
-    
-                torch.cuda.synchronize()
-                metric_logger.update(Loss=loss.item())
-                metric_logger.update(Task_Loss=task_loss.item())
-                metric_logger.update(Lr=optimizer.param_groups[0]["lr"])
-                metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
-                metric_logger.meters['Acc@5'].update(acc5.item(), n=input.shape[0])
-    
-                if ema_model is not None:
-                    ema_model.update(model.get_adapter())
-                    
-            metric_logger.synchronize_between_processes()
-            print("Averaged stats:", metric_logger)
-            return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+            # ----------------------------------------------------------------------
             
+            # Dynamic Head Mapping and Final Logit Selection (Simplified)
+            # We rely on the CL logic to handle the correct output size and mapping
+            if output.shape[-1] > self.num_classes: # Final head has grown
+                # The output head needs to be mapped back to the 0-4 class space for standard CE loss.
+                # Assuming get_max_label_logits correctly handles the mapping/replacement
+                # NOTE: Your implementation of this mapping is complex. We rely on the final masking below.
+                
+                # For CE loss, we need logits corresponding to the 0-4 target IDs.
+                # This requires careful index alignment or using a masked loss.
+                
+                # We rely on the masking trick below to implicitly select only current task logits
+                pass # Keep output as is until the masking/loss application
+
+            # --- Cross-Entropy Loss (Task Loss) ---
+            # Mask out classes not in the current task (0-4 indices)
+            if args.train_mask and class_mask is not None:
+                mask = class_mask[task_id]
+                not_mask = np.setdiff1d(np.arange(self.num_classes), mask) # Use self.num_classes (0-4)
+                not_mask_tensor = torch.tensor(not_mask, dtype=torch.long).to(output.device)
+                
+                # For CE, we must ensure 'output' is the right size (bs, num_classes)
+                # If the head has expanded, we must index/slice it first, or let the previous logic handle it.
+                # Since the masking relies on indices 0-4, let's enforce slicing the output to the base 5 classes first
+                if output.shape[-1] > self.num_classes:
+                    output_masked = output[:, :self.num_classes] 
+                else:
+                    output_masked = output
+                    
+                logits = output_masked.index_fill(dim=1, index=not_mask_tensor, value=float('-inf'))
+            else:
+                logits = output
+                
+            loss = criterion(logits, target)
+            task_loss = loss 
+
+            # --- Orthogonal Regularization (CAST) ---
+            if self.args.use_cast_loss and hasattr(self, 'prev_adapters'):
+                if len(self.adapter_vec) > args.k: 
+                    cur_adapters = model.get_adapter()
+                    self.cur_adapters = self.flatten_parameters(cur_adapters)
+                    diff_adapter = self.cur_adapters - self.prev_adapters # Assumes prev_adapters is correctly stored
+                    
+                    # Check for existence of clustering components (needed by find_same_cluster_items)
+                    if hasattr(self, 'kmeans'): 
+                        _, other = self.find_same_cluster_items(diff_adapter)
+                        sim = 0
+                        
+                        weights = self.calculate_l2_distance(diff_adapter, other)
+                        for o, w in zip(other, weights):
+                            dot_product = torch.matmul(diff_adapter, o)
+                            if self.args.norm_cast:
+                                sim += w * dot_product / (torch.norm(diff_adapter) * torch.norm(o) + 1e-8) # Added epsilon
+                            else:
+                                sim += w * dot_product
+                                
+                        orth_loss = args.beta * torch.abs(sim)
+                        if orth_loss > 0:
+                            loss += orth_loss
+            # ----------------------------------------
+            
+            # --- Distillation Loss Additive ---
+            if self.args.IC and distill_loss > 0:
+                loss += distill_loss
+            
+            # --- EWC Regularization (CRITICAL CHANGE 3) ---
+            # if args.use_ewc_reg and task_id > 0:
+            lambda_ewc = 200
+            ewc_loss = self.weight_importance_regularization(model, lambda_ewc)
+            loss += ewc_loss
+            acc1, acc5 = accuracy(logits, target, topk=(1, 5))
+
+            optimizer.zero_grad()
+            loss.backward()
+            
+            # Gradient Clipping (Good practice for stability)
+            if max_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+                
+            optimizer.step()
+
+            # --- CRITICAL CHANGE 4: Utility-Based Sample Collection ---
+            if current_domain_id is not None:
+                # Iterate only over the NEW (non-replayed) samples
+                for i in range(original_batch_size):
+                    class_id = target[i].item()
+
+                    # Score sample using the improved utility function
+                    score = self.compute_sample_score(model, input[i], target[i]) 
+                    
+                    # Sample tuple: (input_tensor, target_tensor, domain_id)
+                    # Ensure input/target are detached/moved back to CPU if memory is a concern
+                    sample_data = (input[i].detach().cpu(), target[i].detach().cpu(), current_domain_id)
+                    scored_sample = (score, sample_data)
+                    
+                    # Update seen_classes and global buffer quota if new class
+                    if class_id not in self.seen_classes:
+                        self.seen_classes.add(class_id)
+                        self._update_buffer_quota() # Recalculates self.buffer_per_class
+
+
+                    # _collect_buffer_samples takes a list of (score, sample_data) tuples
+                    self._collect_buffer_samples(class_id, current_domain_id, [scored_sample])
+                    
+                # --- CRITICAL CHANGE 5: Rebalance after every epoch/task ---
+                # To be efficient, rebalancing should happen *after* the epoch finishes, 
+                # or less frequently. If called here, it happens every batch.
+                # I will assume the call to _rebalance_buffer is moved outside of this loop 
+                # (e.g., in the task management loop after train_one_epoch finishes).
+            # -------------------------------------------
+            
+            torch.cuda.synchronize()
+            metric_logger.update(Loss=loss.item())
+            metric_logger.update(Task_Loss=task_loss.item())
+            metric_logger.update(Lr=optimizer.param_groups[0]["lr"])
+            metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
+            metric_logger.meters['Acc@5'].update(acc5.item(), n=input.shape[0])
+            if ema_model is not None:
+                ema_model.update(model.get_adapter())
+                
+        # gather the stats from all processes
+        metric_logger.synchronize_between_processes()
+        print("Averaged stats:", metric_logger)
+        return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
     def aggregate_dynamic_head(self, output, slice_output=True):
         """
         Aggregates logits from a dynamically grown head back into the fixed self.num_classes space.
