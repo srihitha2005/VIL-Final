@@ -581,7 +581,7 @@ class Engine():
     
     import math
     import torch
-    from torch.utils.data import Iterable
+    # from torch.utils.data import Iterable
     from typing import Iterable # Explicit import for type hint
 
     # Assuming accuracy function is available globally or imported via utils
