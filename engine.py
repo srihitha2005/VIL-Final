@@ -287,6 +287,20 @@ class Engine():
         
         header = f'Train Task {task_id}: Epoch[{epoch+1:{int(math.log10(args.epochs))+1}}/{args.epochs}]'
         
+        # CRITICAL FIX: Pre-compute head indices mapping to avoid CUDA indexing errors
+        current_task_classes = class_mask[task_id] if class_mask is not None else None
+        current_head_indices_tensor = None
+        
+        if args.train_mask and current_task_classes is not None:
+            current_head_indices = []
+            for cls in current_task_classes:
+                indices = np.where(self.labels_in_head == cls)[0]
+                if len(indices) > 0:
+                    current_head_indices.extend(indices.tolist())
+            
+            if len(current_head_indices) > 0:
+                current_head_indices_tensor = torch.tensor(current_head_indices, dtype=torch.long).to(device)
+        
         for batch_idx, (input, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
             if self.args.develop and batch_idx > 20:
                 break
@@ -298,30 +312,30 @@ class Engine():
             feature = model.forward_features(input)[:, 0]
             output = model.distill_head(feature)
             
-            # CRITICAL FIX 5: Proper class masking for current task
-            if args.train_mask and class_mask is not None:
-                current_task_classes = class_mask[task_id]
+            # CRITICAL FIX 5: Safe class masking with bounds checking
+            if args.train_mask and current_head_indices_tensor is not None:
+                # Verify indices are within bounds
+                max_idx = output.shape[1] - 1
+                valid_indices = current_head_indices_tensor[current_head_indices_tensor <= max_idx]
                 
-                # Map task classes to head indices
-                current_head_indices = []
-                for cls in current_task_classes:
-                    indices = np.where(self.labels_in_head == cls)[0]
-                    if len(indices) > 0:
-                        current_head_indices.extend(indices.tolist())
-                
-                current_head_indices = torch.tensor(current_head_indices, dtype=torch.long).to(device)
-                
-                # Mask irrelevant classes
-                all_indices = torch.arange(output.shape[1], device=device)
-                mask = torch.ones(output.shape[1], dtype=torch.bool, device=device)
-                mask[current_head_indices] = False
-                irrelevant_indices = all_indices[mask]
-                
-                masked_output = output.clone()
-                masked_output[:, irrelevant_indices] = float('-inf')
-                
-                # CRITICAL FIX 6: Numerical stability
-                masked_output = torch.clamp(masked_output, min=-100, max=100)
+                if len(valid_indices) == 0:
+                    print(f"ERROR: No valid head indices found for task {task_id}")
+                    print(f"Output shape: {output.shape[1]}, Labels in head: {self.labels_in_head}")
+                    print(f"Current classes: {current_task_classes}")
+                    masked_output = output
+                else:
+                    # Create mask for irrelevant classes
+                    all_indices = torch.arange(output.shape[1], device=device)
+                    mask = torch.ones(output.shape[1], dtype=torch.bool, device=device)
+                    mask[valid_indices] = False
+                    irrelevant_indices = all_indices[mask]
+                    
+                    masked_output = output.clone()
+                    if len(irrelevant_indices) > 0:
+                        masked_output[:, irrelevant_indices] = float('-inf')
+                    
+                    # CRITICAL FIX 6: Numerical stability
+                    masked_output = torch.clamp(masked_output, min=-100, max=100)
             else:
                 masked_output = torch.clamp(output, min=-100, max=100)
             
