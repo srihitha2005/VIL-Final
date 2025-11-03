@@ -481,8 +481,8 @@ class Engine():
                         if len(cls_indices) > 0 and cls_indices[0] < output.shape[1]:
                             # Boost logits for classes with prototypes
                             proto_similarity = F.cosine_similarity(
-                                feature.unsqueeze(1), 
-                                proto.unsqueeze(0).to(device), 
+                                feature, 
+                                proto.unsqueeze(0).expand(feature.shape[0], -1).to(device), 
                                 dim=-1
                             )
                             output[:, cls_indices[0]] += 0.5 * proto_similarity
