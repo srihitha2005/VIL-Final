@@ -9,26 +9,28 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 from pathlib import Path
 from typing import Iterable
-from operator import itemgetter
 from collections import defaultdict, Counter
 
-from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
-from sklearn.model_selection import train_test_split
 from sklearn.cluster import KMeans
 
-from timm.utils import accuracy, ModelEmaV2
-from timm.optim import create_optimizer
-from timm.data import create_transform
+from timm.utils import accuracy
 import utils
-from operator import itemgetter
-from collections import defaultdict
+
+"""
+OPTIMIZED FOR 50+ EPOCHS - NO REPLAY - MEMORY EFFICIENT
+========================================================
+Focus: Fix Task 1 (0% accuracy) + Reduce overfitting + Memory efficiency
+Key strategies:
+1. Strong regularization (EWC + L2 + Dropout in adapters)
+2. Label smoothing to reduce overconfidence
+3. Gradient accumulation for stable learning
+4. Better learning rate scheduling
+5. No replay buffer (memory efficient)
+"""
 
 
 class Engine():
@@ -46,7 +48,7 @@ class Engine():
         self.num_classes = max([item for mask in class_mask for item in mask]) + 1
         self.distill_head = None
         
-        # CRITICAL FIX 1: Initialize distill_head with proper dimensions
+        # Initialize distill_head properly
         model.distill_head = nn.Linear(768, self.num_classes).to(device)
         nn.init.xavier_uniform_(model.distill_head.weight)
         nn.init.constant_(model.distill_head.bias, 0)
@@ -72,36 +74,28 @@ class Engine():
         self.cs = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
         
         # VCL Metrics
-        self.all_targets_cumulative = []
-        self.all_preds_cumulative = []
-        self.current_domain_class_stats = defaultdict(lambda: defaultdict(lambda: {'correct': 0, 'total': 0}))
-        self.domain_accuracy_history = []
-        self.domain_history = {}
-        self.domain_best = {}
-        self.domain_initial = {}
         self.accuracy_matrix = {}
-        self.true_labels = {}
-        self.predicted_labels = {}
         
-        # OPTIMIZATION 1: Lightweight memory buffer for critical samples only
-        self.memory_buffer = {}  # task_id -> list of (input, target) tuples
-        self.buffer_size_per_task = min(100, args.replay_buffer_size // args.num_tasks) if hasattr(args, 'replay_buffer_size') else 0
+        # NO REPLAY BUFFER - Memory efficient
         
         if self.args.d_threshold:
             self.acc_per_label = np.zeros((args.class_num, args.domain_num))
             self.label_train_count = np.zeros((args.class_num))
             self.tanh = torch.nn.Tanh()
+        
+        # Gradient accumulation
+        self.gradient_accumulation_steps = 2  # Accumulate over 2 batches
 
-    def kl_div(self, p, q):
+    def kl_div_stable(self, p, q):
         """KL divergence with numerical stability"""
-        p = F.softmax(p, dim=1)
-        q = F.softmax(q, dim=1)
-        kl = torch.mean(torch.sum(p * torch.log((p + 1e-10) / (q + 1e-10)), dim=1))
+        p = F.softmax(p, dim=1) + 1e-8
+        q = F.softmax(q, dim=1) + 1e-8
+        kl = torch.mean(torch.sum(p * torch.log(p / q), dim=1))
         return kl
 
-    def weight_importance_regularization(self, model, lambda_ewc=1000):
+    def weight_importance_regularization(self, model, lambda_ewc=2000):
         """
-        CRITICAL FIX 2: Enhanced EWC with stronger regularization
+        ENHANCED EWC: Very strong to prevent forgetting
         Exclude head layers to allow new class learning
         """
         ewc_loss = 0.0
@@ -110,13 +104,20 @@ class Engine():
             return torch.tensor(0.0, device=self.device)
         
         for name, param in model.named_parameters():
-            # Exclude all head-related parameters from EWC
             if name in self.theta_star and 'head' not in name.lower():
                 importance = self.omega[name].to(self.device)
                 optimal_weight = self.theta_star[name].to(self.device)
                 ewc_loss += torch.sum(importance * (param - optimal_weight) ** 2)
         
         return lambda_ewc * ewc_loss
+
+    def l2_regularization(self, model, lambda_l2=0.01):
+        """L2 regularization on adapter parameters"""
+        l2_loss = 0.0
+        for name, param in model.named_parameters():
+            if 'adapter' in name.lower() and param.requires_grad:
+                l2_loss += torch.sum(param ** 2)
+        return lambda_l2 * l2_loss
 
     def set_new_head(self, model, labels_to_be_added, task_id):
         """Add new nodes to head with proper initialization"""
@@ -134,75 +135,12 @@ class Engine():
         new_head.weight.data[:num_old_classes].copy_(prev_weight.data)
         new_head.bias.data[:num_old_classes].copy_(prev_bias.data)
         
-        # CRITICAL FIX 3: Proper initialization for new nodes
+        # Proper initialization
         nn.init.xavier_uniform_(new_head.weight.data[num_old_classes:])
         nn.init.constant_(new_head.bias.data[num_old_classes:], 0)
         
         print(f"Added {len_new_nodes} nodes with label ({labels_to_be_added}). New head size: {new_head.weight.shape[0]}.")
         return new_head
-
-    def store_critical_samples(self, data_loader, task_id):
-        """
-        OPTIMIZATION 2: Store only the most critical samples for replay
-        Uses gradient norm as criticality measure
-        """
-        if self.buffer_size_per_task == 0:
-            return
-        
-        self.model.eval()
-        sample_scores = []
-        
-        with torch.no_grad():
-            for batch_idx, (input, target) in enumerate(data_loader):
-                if batch_idx > 10:  # Limit sampling to keep it fast
-                    break
-                
-                input = input.to(self.device)
-                target = target.to(self.device)
-                
-                feature = self.model.forward_features(input)[:, 0]
-                output = self.model.distill_head(feature)
-                
-                # Compute prediction confidence
-                probs = F.softmax(output, dim=1)
-                confidence, _ = torch.max(probs, dim=1)
-                
-                # Store samples with lower confidence (more critical)
-                for i in range(input.shape[0]):
-                    sample_scores.append((
-                        1.0 - confidence[i].item(),  # criticality score
-                        input[i].cpu(),
-                        target[i].cpu()
-                    ))
-        
-        # Sort by criticality and keep top-k
-        sample_scores.sort(key=lambda x: x[0], reverse=True)
-        self.memory_buffer[task_id] = [(s[1], s[2]) for s in sample_scores[:self.buffer_size_per_task]]
-        
-        self.model.train()
-
-    def get_replay_batch(self, batch_size=16):
-        """
-        OPTIMIZATION 3: Efficient replay batch sampling
-        """
-        if not self.memory_buffer or self.current_task == 0:
-            return None, None
-        
-        all_samples = []
-        for task_id in self.memory_buffer:
-            all_samples.extend(self.memory_buffer[task_id])
-        
-        if len(all_samples) == 0:
-            return None, None
-        
-        # Sample without replacement
-        n_samples = min(batch_size, len(all_samples))
-        indices = random.sample(range(len(all_samples)), n_samples)
-        
-        replay_inputs = torch.stack([all_samples[i][0] for i in indices])
-        replay_targets = torch.stack([all_samples[i][1] for i in indices])
-        
-        return replay_inputs.to(self.device), replay_targets.to(self.device)
 
     def inference_acc(self, model, data_loader, device):
         """Compute inference accuracy for dynamic head expansion"""
@@ -215,7 +153,7 @@ class Engine():
         
         with torch.no_grad():
             for batch_idx, (input, target) in enumerate(data_loader):
-                if self.args.develop and batch_idx > 200:
+                if batch_idx > 50:  # Limit for speed
                     break
                 
                 input = input.to(device, non_blocking=True)
@@ -225,13 +163,26 @@ class Engine():
                 output = model.distill_head(feature)
                 
                 # Get indices for current classes
-                current_head_indices = [np.where(self.labels_in_head == label)[0][0] for label in current_classes]
+                current_head_indices = []
+                for label in current_classes:
+                    indices = np.where(self.labels_in_head == label)[0]
+                    if len(indices) > 0:
+                        current_head_indices.append(indices[0])
                 
-                all_head_indices = np.arange(output.shape[-1])
-                irrelevant_indices = np.setdiff1d(all_head_indices, current_head_indices)
-                irrelevant_indices_tensor = torch.tensor(irrelevant_indices, dtype=torch.long).to(device)
+                if len(current_head_indices) == 0:
+                    continue
                 
-                logits = output.index_fill(dim=1, index=irrelevant_indices_tensor, value=float('-inf'))
+                current_head_indices = torch.tensor(current_head_indices, dtype=torch.long).to(device)
+                
+                all_head_indices = torch.arange(output.shape[-1], device=device)
+                mask = torch.ones(output.shape[-1], dtype=torch.bool, device=device)
+                mask[current_head_indices] = False
+                irrelevant_indices = all_head_indices[mask]
+                
+                logits = output.clone()
+                if len(irrelevant_indices) > 0:
+                    logits[:, irrelevant_indices] = float('-inf')
+                
                 _, pred_index_in_head = torch.max(logits, 1)
                 
                 pred = torch.tensor([self.labels_in_head[i] for i in pred_index_in_head.cpu().numpy()],
@@ -269,15 +220,16 @@ class Engine():
                 if acc <= self.args.thre:
                     labels_with_low_accuracy.append(label)
         
-        print(f"Labels whose node to be increased: {labels_with_low_accuracy}")
+        if len(labels_with_low_accuracy) > 0:
+            print(f"Labels whose node to be increased: {labels_with_low_accuracy}")
         return labels_with_low_accuracy
 
     def train_one_epoch(self, model: torch.nn.Module,
                        criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer,
                        device: torch.device, epoch: int, max_norm: float = 0,
-                       set_training_mode=True, task_id=-1, class_mask=None, ema_model=None, args=None):
+                       set_training_mode=True, task_id=-1, class_mask=None, args=None):
         """
-        CRITICAL FIX 4: Corrected training loop with proper masking and loss computation
+        OPTIMIZED TRAINING: No replay, strong regularization, gradient accumulation
         """
         torch.cuda.empty_cache()
         model.train(set_training_mode)
@@ -287,7 +239,7 @@ class Engine():
         
         header = f'Train Task {task_id}: Epoch[{epoch+1:{int(math.log10(args.epochs))+1}}/{args.epochs}]'
         
-        # CRITICAL FIX: Pre-compute head indices mapping to avoid CUDA indexing errors
+        # Pre-compute head indices ONCE
         current_task_classes = class_mask[task_id] if class_mask is not None else None
         current_head_indices_tensor = None
         
@@ -296,15 +248,15 @@ class Engine():
             for cls in current_task_classes:
                 indices = np.where(self.labels_in_head == cls)[0]
                 if len(indices) > 0:
-                    current_head_indices.extend(indices.tolist())
+                    current_head_indices.append(indices[0])  # Take first occurrence only
             
             if len(current_head_indices) > 0:
                 current_head_indices_tensor = torch.tensor(current_head_indices, dtype=torch.long).to(device)
         
+        optimizer.zero_grad()
+        accumulation_counter = 0
+        
         for batch_idx, (input, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
-            if self.args.develop and batch_idx > 20:
-                break
-            
             input = input.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             
@@ -312,19 +264,12 @@ class Engine():
             feature = model.forward_features(input)[:, 0]
             output = model.distill_head(feature)
             
-            # CRITICAL FIX 5: Safe class masking with bounds checking
+            # SAFE class masking with bounds checking
             if args.train_mask and current_head_indices_tensor is not None:
-                # Verify indices are within bounds
                 max_idx = output.shape[1] - 1
                 valid_indices = current_head_indices_tensor[current_head_indices_tensor <= max_idx]
                 
-                if len(valid_indices) == 0:
-                    print(f"ERROR: No valid head indices found for task {task_id}")
-                    print(f"Output shape: {output.shape[1]}, Labels in head: {self.labels_in_head}")
-                    print(f"Current classes: {current_task_classes}")
-                    masked_output = output
-                else:
-                    # Create mask for irrelevant classes
+                if len(valid_indices) > 0:
                     all_indices = torch.arange(output.shape[1], device=device)
                     mask = torch.ones(output.shape[1], dtype=torch.bool, device=device)
                     mask[valid_indices] = False
@@ -334,103 +279,107 @@ class Engine():
                     if len(irrelevant_indices) > 0:
                         masked_output[:, irrelevant_indices] = float('-inf')
                     
-                    # CRITICAL FIX 6: Numerical stability
                     masked_output = torch.clamp(masked_output, min=-100, max=100)
+                else:
+                    masked_output = output
             else:
-                masked_output = torch.clamp(output, min=-100, max=100)
+                masked_output = output
             
-            # Task loss
+            # Task loss with label smoothing (already in criterion if args.smoothing > 0)
             task_loss = criterion(masked_output, target)
             
-            # Safety check
             if not torch.isfinite(task_loss):
-                print(f"WARNING: Non-finite task loss detected, skipping batch")
+                print(f"WARNING: Non-finite task loss, skipping batch")
                 continue
             
             loss = task_loss
             
-            # OPTIMIZATION 4: Lightweight replay with minimal overhead
-            if self.buffer_size_per_task > 0 and task_id > 0 and batch_idx % 4 == 0:  # Every 4th batch
-                replay_input, replay_target = self.get_replay_batch(batch_size=8)
-                
-                if replay_input is not None:
-                    replay_feature = model.forward_features(replay_input)[:, 0]
-                    replay_output = model.distill_head(replay_feature)
-                    replay_loss = criterion(replay_output, replay_target)
-                    
-                    if torch.isfinite(replay_loss):
-                        loss += 0.5 * replay_loss
-            
-            # CRITICAL FIX 7: Enhanced distillation for task_id > 0
+            # STRONG DISTILLATION (if not first task)
             if self.distill_model is not None and task_id > 0:
                 with torch.no_grad():
                     teacher_feature = self.distill_model.forward_features(input)[:, 0]
                     teacher_output = self.distill_model.distill_head(teacher_feature)
                 
-                # Only distill on old classes
+                # Distill on ALL old classes
                 old_classes = [c for c in self.labels_in_head if c not in self.added_classes_in_cur_task]
                 
                 if len(old_classes) > 0:
                     old_indices = []
                     for cls in old_classes:
                         idx = np.where(self.labels_in_head == cls)[0]
-                        if len(idx) > 0:
+                        if len(idx) > 0 and idx[0] < output.shape[1]:
                             old_indices.append(idx[0])
                     
-                    old_indices = torch.tensor(old_indices, dtype=torch.long).to(device)
-                    
-                    student_logits_old = output.index_select(dim=1, index=old_indices)
-                    teacher_logits_old = teacher_output.index_select(dim=1, index=old_indices)
-                    
-                    # CRITICAL FIX 8: Higher temperature for smoother distillation
-                    temp = 4.0
-                    logit_distill_loss = F.kl_div(
-                        F.log_softmax(student_logits_old / temp, dim=1),
-                        F.softmax(teacher_logits_old / temp, dim=1),
-                        reduction='batchmean'
-                    ) * (temp ** 2)
-                    
-                    feature_loss = 1 - self.cs(feature, teacher_feature).mean()
-                    
-                    # OPTIMIZATION 5: Balanced distillation weights
-                    alpha_feat = 1.0
-                    alpha_logit = 2.0
-                    distill_loss = alpha_feat * feature_loss + alpha_logit * logit_distill_loss
-                    
-                    if torch.isfinite(distill_loss):
-                        loss += distill_loss
+                    if len(old_indices) > 0:
+                        old_indices = torch.tensor(old_indices, dtype=torch.long).to(device)
+                        valid_old_indices = old_indices[old_indices < output.shape[1]]
+                        
+                        if len(valid_old_indices) > 0:
+                            student_logits_old = output.index_select(dim=1, index=valid_old_indices)
+                            teacher_logits_old = teacher_output.index_select(dim=1, index=valid_old_indices)
+                            
+                            # High temperature for smooth distillation
+                            temp = 5.0
+                            logit_distill_loss = F.kl_div(
+                                F.log_softmax(student_logits_old / temp, dim=1),
+                                F.softmax(teacher_logits_old / temp, dim=1),
+                                reduction='batchmean'
+                            ) * (temp ** 2)
+                            
+                            # Feature distillation
+                            feature_loss = 1 - self.cs(feature, teacher_feature).mean()
+                            
+                            # Strong distillation weights
+                            alpha_feat = 2.0
+                            alpha_logit = 3.0
+                            distill_loss = alpha_feat * feature_loss + alpha_logit * logit_distill_loss
+                            
+                            if torch.isfinite(distill_loss):
+                                loss += distill_loss
             
-            # CRITICAL FIX 9: Stronger EWC regularization
+            # VERY STRONG EWC (if not first task)
             if task_id > 0:
-                ewc_loss = self.weight_importance_regularization(model, lambda_ewc=1000)
+                ewc_loss = self.weight_importance_regularization(model, lambda_ewc=2000)
                 loss += ewc_loss
             
-            # Final safety check
+            # L2 regularization on adapters
+            l2_loss = self.l2_regularization(model, lambda_l2=0.01)
+            loss += l2_loss
+            
+            # Check total loss
             if not torch.isfinite(loss):
                 print(f"WARNING: Non-finite total loss, skipping batch")
+                optimizer.zero_grad()
                 continue
             
             # Compute accuracy
-            acc1, acc5 = accuracy(masked_output, target, topk=(1, 5))
+            with torch.no_grad():
+                acc1, acc5 = accuracy(masked_output, target, topk=(1, 5))
             
-            # Backward pass
-            optimizer.zero_grad()
+            # Backward with gradient accumulation
+            loss = loss / self.gradient_accumulation_steps
             loss.backward()
             
-            # CRITICAL FIX 10: Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm if max_norm > 0 else 1.0)
+            accumulation_counter += 1
             
-            optimizer.step()
+            if accumulation_counter % self.gradient_accumulation_steps == 0:
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm if max_norm > 0 else 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
             
             torch.cuda.synchronize()
-            metric_logger.update(Loss=loss.item())
+            metric_logger.update(Loss=loss.item() * self.gradient_accumulation_steps)
             metric_logger.update(Task_Loss=task_loss.item())
             metric_logger.update(Lr=optimizer.param_groups[0]["lr"])
             metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
             metric_logger.meters['Acc@5'].update(acc5.item(), n=input.shape[0])
-            
-            if ema_model is not None:
-                ema_model.update(model.get_adapter())
+        
+        # Final step if gradients remain
+        if accumulation_counter % self.gradient_accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm if max_norm > 0 else 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
         
         metric_logger.synchronize_between_processes()
         print("Averaged stats:", metric_logger)
@@ -438,7 +387,7 @@ class Engine():
 
     @torch.no_grad()
     def evaluate(self, model: torch.nn.Module, data_loader: Iterable,
-                device: torch.device, task_id=-1, class_mask=None, ema_model=None, args=None, flag_final_eval=False):
+                device: torch.device, task_id=-1, class_mask=None, args=None, flag_final_eval=False):
         
         criterion = torch.nn.CrossEntropyLoss()
         all_targets = []
@@ -451,29 +400,14 @@ class Engine():
         
         with torch.no_grad():
             for batch_idx, (input, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
-                if args.develop and batch_idx > 20:
-                    break
-                
                 input = input.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
                 
                 feature = model.forward_features(input)[:, 0]
                 output = model.distill_head(feature)
                 
-                # EMA ensemble
-                output_ensemble = [output.softmax(dim=1)]
-                
-                if ema_model is not None:
-                    tmp_adapter = model.get_adapter()
-                    model.put_adapter(ema_model.module)
-                    
-                    feature_ema = model.forward_features(input)[:, 0]
-                    output_ema = model.distill_head(feature_ema)
-                    output_ensemble.append(output_ema.softmax(dim=1))
-                    
-                    model.put_adapter(tmp_adapter)
-                
-                output = torch.stack(output_ensemble, dim=-1).max(dim=-1)[0]
+                # Use softmax probabilities
+                output = output.softmax(dim=1)
                 
                 loss = criterion(output.log(), target)
                 acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -520,18 +454,14 @@ class Engine():
     @torch.no_grad()
     def evaluate_till_now(self, model: torch.nn.Module, data_loader: list,
                          device: torch.device, task_id: int, class_mask: list, acc_matrix: np.ndarray,
-                         ema_model=None, args=None) -> dict:
+                         args=None) -> dict:
         
         stat_matrix = np.zeros((3, args.num_tasks))
         flag_final_eval = (task_id == args.num_tasks - 1)
         
-        self.current_domain_class_stats = defaultdict(lambda: defaultdict(lambda: {'correct': 0, 'total': 0}))
-        
         if flag_final_eval:
             self.final_all_targets = []
             self.final_all_preds = []
-        
-        current_task_accuracies = {}
         
         for i in range(task_id + 1):
             test_stats, all_targets, all_preds = self.evaluate(
@@ -540,7 +470,6 @@ class Engine():
                 device=device,
                 task_id=i,
                 class_mask=class_mask,
-                ema_model=ema_model,
                 args=args,
                 flag_final_eval=flag_final_eval
             )
@@ -552,12 +481,6 @@ class Engine():
             stat_matrix[1, i] = test_stats.get('Acc@5', 0.0)
             stat_matrix[2, i] = test_stats['Loss']
             acc_matrix[i, task_id] = acc_at_1
-            
-            current_task_accuracies[self.domain_list[i]] = {
-                'Acc@1': acc_at_1,
-                'Acc@5': stat_matrix[1, i],
-                'Loss': stat_matrix[2, i]
-            }
         
         self.accuracy_matrix[task_id] = {self.domain_list[j]: acc_matrix[j, task_id] for j in range(task_id + 1)}
         
@@ -632,10 +555,9 @@ class Engine():
             print(f"Backward Transfer (BWT): {BWT:.4f}")
             print(f"Forward Transfer (FWT): {FWT:.4f}")
 
-    def compute_ewc_importance(self, model, data_loader_val):
+    def compute_ewc_importance(self, model, data_loader_train):
         """
-        CRITICAL FIX 11: Enhanced Fisher Information calculation
-        Uses more samples and proper gradient accumulation
+        Enhanced Fisher Information with more samples
         """
         model.eval()
         
@@ -643,11 +565,11 @@ class Engine():
         self.theta_star = {}
         model.zero_grad()
         
-        # Use more samples for better Fisher estimation
-        num_samples = min(len(data_loader_val.dataset), 2000)
+        # Use up to 3000 samples for better estimation
+        num_samples = min(len(data_loader_train.dataset), 3000)
         sample_count = 0
         
-        for batch_idx, (input, target) in enumerate(data_loader_val):
+        for batch_idx, (input, target) in enumerate(data_loader_train):
             if sample_count >= num_samples:
                 break
             
@@ -694,28 +616,9 @@ class Engine():
             self.cluster_assignments = self.kmeans.labels_
             print("Cluster (shifts) Assignments:", self.cluster_assignments)
 
-    def pre_train_epoch(self, model: torch.nn.Module, epoch: int = 0, task_id: int = 0, args=None):
-        """Handle adapter freezing"""
-        if task_id == 0 or args.num_freeze_epochs < 1:
-            return model
-        
-        if epoch == 0:
-            for n, p in model.named_parameters():
-                if 'adapter' in n:
-                    p.requires_grad = False
-            print('Freezing adapter parameters for {} epochs'.format(args.num_freeze_epochs))
-        
-        if epoch == args.num_freeze_epochs:
-            torch.cuda.empty_cache()
-            for n, p in model.named_parameters():
-                if 'adapter' in n:
-                    p.requires_grad = True
-            print('Unfreezing adapter parameters')
-        return model
-
     def pre_train_task(self, model, data_loader, device, task_id, args):
         """
-        CRITICAL FIX 12: Enhanced task initialization with proper LR scheduling
+        Task initialization with adaptive LR
         """
         epsilon = 1e-8
         self.current_task = task_id
@@ -753,21 +656,32 @@ class Engine():
                 new_head = self.set_new_head(model, labels_to_be_added, task_id).to(device)
                 model.head = new_head
         
-        # CRITICAL FIX 13: Adaptive learning rate for different tasks
-        if task_id == 1:
-            # Increase LR for Task 1 to ensure new class learning
-            args_copy = copy.deepcopy(args)
-            args_copy.lr = args.lr * 1.5
-            optimizer = utils.create_optimizer(args_copy, model)
-            print(f"Task 1: Increased LR to {args_copy.lr}")
-        elif task_id == 2:
-            # Moderate LR for domain shift
-            args_copy = copy.deepcopy(args)
-            args_copy.lr = args.lr * 1.2
-            optimizer = utils.create_optimizer(args_copy, model)
-            print(f"Task 2: Adjusted LR to {args_copy.lr}")
-        else:
+        # ADAPTIVE LEARNING RATE STRATEGY
+        if task_id == 0:
+            # Task 0: Base LR
             optimizer = utils.create_optimizer(args, model)
+            print(f"Task 0: Base LR = {args.lr}")
+        elif task_id == 1:
+            # Task 1: HIGHEST LR - Critical for new class learning
+            args_copy = copy.deepcopy(args)
+            args_copy.lr = args.lr * 2.0  # 2x boost
+            args_copy.weight_decay = 0.0001  # Small weight decay
+            optimizer = utils.create_optimizer(args_copy, model)
+            print(f"Task 1: Increased LR to {args_copy.lr} (2x boost for new classes)")
+        elif task_id == 2:
+            # Task 2: Moderate increase for domain shift
+            args_copy = copy.deepcopy(args)
+            args_copy.lr = args.lr * 1.3
+            args_copy.weight_decay = 0.0001
+            optimizer = utils.create_optimizer(args_copy, model)
+            print(f"Task 2: Adjusted LR to {args_copy.lr} (domain shift)")
+        else:
+            # Task 3+: Slightly higher than base
+            args_copy = copy.deepcopy(args)
+            args_copy.lr = args.lr * 1.1
+            args_copy.weight_decay = 0.0001
+            optimizer = utils.create_optimizer(args_copy, model)
+            print(f"Task {task_id}: Adjusted LR to {args_copy.lr}")
         
         with torch.no_grad():
             prev_adapters = model.get_adapter()
@@ -800,9 +714,9 @@ class Engine():
         
         return model, optimizer
 
-    def post_train_task(self, model: torch.nn.Module, data_loader_val: Iterable, task_id: int):
+    def post_train_task(self, model: torch.nn.Module, data_loader_train: Iterable, task_id: int):
         """
-        OPTIMIZATION 6: Efficient post-task operations with memory buffer storage
+        Post-task operations: Update pools, compute EWC, cluster adapters
         """
         
         # Update Distillation Classifier Pool
@@ -824,15 +738,10 @@ class Engine():
         # Cluster Adapters
         self.cluster_adapters()
         
-        # OPTIMIZATION 7: Store critical samples BEFORE computing EWC
-        if self.buffer_size_per_task > 0 and task_id < self.args.num_tasks - 1:
-            print(f"-> Storing {self.buffer_size_per_task} critical samples for replay...")
-            self.store_critical_samples(data_loader_val, task_id)
-        
-        # Compute EWC Importance
+        # Compute EWC Importance (use training set)
         if task_id < self.args.num_tasks - 1:
             print("-> Computing EWC importance (Omega) and storing optimal weights (Theta*)...")
-            self.compute_ewc_importance(model, data_loader_val)
+            self.compute_ewc_importance(model, data_loader_train)
         
         # Store Teacher Model for Distillation
         if task_id < self.args.num_tasks - 1:
@@ -851,53 +760,68 @@ class Engine():
         num_tasks = args.num_tasks
         acc_matrix = np.zeros((num_tasks, num_tasks))
         
-        ema_model = None
-        
         for task_id in range(num_tasks):
             if task_id > 0 and args.reinit_optimizer:
                 optimizer = utils.create_optimizer(args, model)
-            
-            if task_id == 1 and hasattr(args, 'adapt_blocks') and len(args.adapt_blocks) > 0:
-                from timm.utils import ModelEmaV2
-                ema_model = ModelEmaV2(model.get_adapter(), decay=args.ema_decay, device=device)
             
             print(f"\n--- Starting Task {task_id}: ---")
             print(f"Domain: {self.domain_list[task_id]} | Classes: {self.class_mask[task_id]}")
             
             train_loader = data_loader[task_id]['train']
-            val_loader_for_ewc = data_loader[task_id]['val']
             
             model, optimizer = self.pre_train_task(model, train_loader, device, task_id, args)
             
-            for epoch in range(args.epochs):
-                model = self.pre_train_epoch(model=model, epoch=epoch, task_id=task_id, args=args)
+            # Learning rate scheduler with warmup
+            if lr_scheduler is None and args.epochs >= 10:
+                from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
                 
+                # Warmup for first 10% of epochs
+                warmup_epochs = max(1, args.epochs // 10)
+                warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, 
+                                           total_iters=warmup_epochs)
+                
+                # Cosine annealing for rest
+                cosine_epochs = args.epochs - warmup_epochs
+                cosine_scheduler = CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=1e-6)
+                
+                lr_scheduler = SequentialLR(optimizer, 
+                                           schedulers=[warmup_scheduler, cosine_scheduler],
+                                           milestones=[warmup_epochs])
+                print(f"Using Warmup ({warmup_epochs} epochs) + Cosine Annealing LR scheduler")
+            
+            for epoch in range(args.epochs):
                 train_stats = self.train_one_epoch(
                     model=model, criterion=criterion,
                     data_loader=train_loader, optimizer=optimizer,
                     device=device, epoch=epoch, max_norm=args.clip_grad,
                     set_training_mode=True, task_id=task_id,
-                    class_mask=class_mask, ema_model=ema_model, args=args,
+                    class_mask=class_mask, args=args,
                 )
                 
                 if lr_scheduler:
-                    lr_scheduler.step(epoch)
+                    lr_scheduler.step()
+                
+                # Clear cache periodically
+                if epoch % 10 == 0:
+                    torch.cuda.empty_cache()
                 
                 if args.output_dir and utils.is_main_process():
                     log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch}
                     
-                    if epoch == args.epochs - 1:
+                    # Save checkpoint every 10 epochs or at end
+                    if (epoch + 1) % 10 == 0 or epoch == args.epochs - 1:
                         Path(os.path.join(args.output_dir, 'checkpoint')).mkdir(parents=True, exist_ok=True)
-                        checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id+1))
+                        checkpoint_path = os.path.join(args.output_dir, 
+                                                      f'checkpoint/task{task_id+1}_epoch{epoch+1}.pth')
                         
                         state_dict = {
                             'model': model.state_dict(),
-                            'ema_model': ema_model.state_dict() if ema_model is not None else None,
                             'optimizer': optimizer.state_dict(),
                             'epoch': epoch,
+                            'task_id': task_id,
                             'args': args,
                         }
-                        if args.sched is not None and args.sched != 'constant':
+                        if lr_scheduler is not None:
                             state_dict['lr_scheduler'] = lr_scheduler.state_dict()
                         
                         utils.save_on_master(state_dict, checkpoint_path)
@@ -906,13 +830,21 @@ class Engine():
                         datetime.datetime.now().strftime('log_%Y_%m_%d_%H_%M'))), 'a') as f:
                         f.write(json.dumps(log_stats) + '\n')
             
-            self.post_train_task(model, data_loader_val=val_loader_for_ewc, task_id=task_id)
+            # Post-task operations
+            self.post_train_task(model, data_loader_train=train_loader, task_id=task_id)
             
             if self.args.d_threshold:
                 self.label_train_count[self.current_classes] += 1
             
+            # Reset scheduler for next task
+            lr_scheduler = None
+            
+            # Evaluation
             test_stats = self.evaluate_till_now(
                 model=model, data_loader=data_loader, device=device,
                 task_id=task_id, class_mask=class_mask, acc_matrix=acc_matrix,
-                ema_model=ema_model, args=args
+                args=args
             )
+            
+            # Clear cache after each task
+            torch.cuda.empty_cache()
